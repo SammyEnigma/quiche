@@ -133,6 +133,9 @@ pub struct Recovery {
     pacing_rate: u64,
 
     last_packet_scheduled_time: Option<Instant>,
+
+    // RFC6937 PRR.
+    prr: prr::PRR,
 }
 
 impl Recovery {
@@ -208,6 +211,8 @@ impl Recovery {
             pacing_rate: 0,
 
             last_packet_scheduled_time: None,
+
+            prr: prr::PRR::default(),
         }
     }
 
@@ -238,6 +243,8 @@ impl Recovery {
                 (self.bytes_in_flight + sent_bytes) < self.congestion_window;
 
             self.on_packet_sent_cc(sent_bytes, now);
+
+            self.prr.on_packet_sent(sent_bytes);
 
             self.set_loss_detection_timer(handshake_status, now);
         }
@@ -521,7 +528,9 @@ impl Recovery {
             return std::usize::MAX;
         }
 
-        self.congestion_window.saturating_sub(self.bytes_in_flight)
+        // Open more space (snd_cnt) for PRR when allowed.
+        self.congestion_window.saturating_sub(self.bytes_in_flight) +
+            self.prr.snd_cnt
     }
 
     pub fn rtt(&self) -> Duration {
@@ -1764,4 +1773,5 @@ mod tests {
 mod cubic;
 mod delivery_rate;
 mod hystart;
+mod prr;
 mod reno;
