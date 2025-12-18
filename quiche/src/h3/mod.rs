@@ -2862,6 +2862,16 @@ impl Connection {
                     }
                 },
 
+                stream::State::SkipFramePayload => {
+                    stream.try_skip_frame(conn)?;
+
+                    // Check whether the frame has FIN'd by QUIC to prevent
+                    // trying to read again on a closed stream.
+                    if conn.stream_finished(stream_id) {
+                        break;
+                    }
+                },
+
                 stream::State::Drain => {
                     // Discard incoming data on the stream.
                     conn.stream_shutdown(
@@ -4232,7 +4242,7 @@ mod tests {
             more_frames: true,
         };
 
-        // Inject a GREASE frame
+        // Inject a GREASE frame.
         let mut d = [42; 10];
         let mut b = octets::OctetsMut::with_slice(&mut d);
 

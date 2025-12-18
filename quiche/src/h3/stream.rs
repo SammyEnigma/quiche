@@ -84,6 +84,9 @@ pub enum State {
     /// Reading a QPACK instruction.
     QpackInstruction,
 
+    /// Reading the stream's current frame's payload without buffering the data.
+    SkipFramePayload,
+
     /// Reading and discarding data.
     Drain,
 
@@ -500,7 +503,14 @@ impl Stream {
                 (State::FramePayload, true)
             },
 
-            _ => (State::FramePayload, true),
+            // Ignore unknown frames' payloads.
+            _ => {
+                if len > MAX_STATE_BUF_SIZE as u64 {
+                    return Err(Error::ExcessiveLoad);
+                }
+
+                (State::SkipFramePayload, false)
+            },
         };
 
         self.state_transition(state, len as usize, resize)?;
@@ -525,15 +535,7 @@ impl Stream {
 
         let read = match conn.stream_recv(self.id, buf) {
             Ok((len, fin)) => {
-                // Check whether one of the critical stream was closed.
-                if fin &&
-                    matches!(
-                        self.ty,
-                        Some(Type::Control) |
-                            Some(Type::QpackEncoder) |
-                            Some(Type::QpackDecoder)
-                    )
-                {
+                if self.critical_stream_closed(fin) {
                     super::close_conn_critical_stream(conn)?;
                 }
 
@@ -541,13 +543,7 @@ impl Stream {
             },
 
             Err(e @ crate::Error::StreamReset(_)) => {
-                // Check whether one of the critical stream was closed.
-                if matches!(
-                    self.ty,
-                    Some(Type::Control) |
-                        Some(Type::QpackEncoder) |
-                        Some(Type::QpackDecoder)
-                ) {
+                if self.critical_stream_closed(true) {
                     super::close_conn_critical_stream(conn)?;
                 }
 
@@ -566,6 +562,67 @@ impl Stream {
 
         trace!(
             "{} read {} bytes on stream {}",
+            conn.trace_id(),
+            read,
+            self.id,
+        );
+
+        self.state_off += read;
+
+        if !self.state_buffer_complete() {
+            self.reset_data_event();
+
+            return Err(Error::Done);
+        }
+
+        Ok(())
+    }
+
+    /// Tries to read data from the corresponding transport stream up to the
+    /// state's size, without storing the data in the state buffer.
+    ///
+    /// When not enough data can be read to complete the state, this returns
+    /// `Error::Done`.
+    pub fn try_skip_data<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>,
+    ) -> Result<()> {
+        // If no bytes are required to be read, return early.
+        if self.state_buffer_complete() {
+            return Ok(());
+        }
+
+        let len = self.state_len - self.state_off;
+
+        let read = match conn.stream_discard(self.id, len) {
+            Ok((len, fin)) => {
+                if self.critical_stream_closed(fin) {
+                    super::close_conn_critical_stream(conn)?;
+                }
+
+                len
+            },
+
+            Err(e @ crate::Error::StreamReset(_)) => {
+                if self.critical_stream_closed(true) {
+                    super::close_conn_critical_stream(conn)?;
+                }
+
+                return Err(e.into());
+            },
+
+            Err(e) => {
+                // The stream is not readable anymore, so re-arm the Data
+                // event.
+                if e == crate::Error::Done {
+                    self.reset_data_event();
+                }
+
+                return Err(e.into());
+            },
+        };
+
+        trace!(
+            "{} discarded {} bytes on stream {}",
             conn.trace_id(),
             read,
             self.id,
@@ -685,6 +742,20 @@ impl Stream {
         Ok((frame, payload_len))
     }
 
+    /// Tries to skip the current frame's payload.
+    pub fn try_skip_frame<F: BufFactory>(
+        &mut self, conn: &mut crate::Connection<F>,
+    ) -> Result<()> {
+        self.try_skip_data(conn)?;
+
+        // Processing a frame other than DATA, so re-arm the Data event.
+        self.reset_data_event();
+
+        self.state_transition(State::FrameType, 1, true)?;
+
+        Ok(())
+    }
+
     /// Tries to read DATA payload from the transport stream.
     pub fn try_consume_data<F: BufFactory, OUT: bytes::BufMut>(
         &mut self, conn: &mut crate::Connection<F>, out: OUT,
@@ -778,6 +849,16 @@ impl Stream {
     /// Returns `true` if there is a priority update.
     pub fn has_last_priority_update(&self) -> bool {
         self.last_priority_update.is_some()
+    }
+
+    /// Checks whether one of the critical streams was closed.
+    fn critical_stream_closed(&self, fin: bool) -> bool {
+        fin && matches!(
+            self.ty,
+            Some(Type::Control) |
+                Some(Type::QpackEncoder) |
+                Some(Type::QpackDecoder)
+        )
     }
 
     /// Returns true if the state buffer has enough data to complete the state.
