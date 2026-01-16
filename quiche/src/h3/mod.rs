@@ -5999,7 +5999,7 @@ mod tests {
         config.set_initial_congestion_window_packets(100);
 
         let mut h3_config = Config::new().unwrap();
-        h3_config.set_max_field_section_size(131072);
+        h3_config.set_max_field_section_size(256 * 1024);
 
         let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
 
