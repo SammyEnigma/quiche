@@ -180,6 +180,10 @@ pub struct Stream {
     /// frames. Related to SETTINGS_MAX_FIELD_LIST_SIZE; see
     /// <https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1>
     max_encoded_headers_payload_size: u64,
+
+    /// Max PRIORITY_UPDATE frame payload size; see
+    /// <https://datatracker.ietf.org/doc/html/rfc9218#section-7.2>
+    max_priority_update_size: u64,
 }
 
 impl Stream {
@@ -189,6 +193,7 @@ impl Stream {
     /// local endpoint, or by the peer.
     pub fn new(
         id: u64, is_local: bool, max_field_section_size: Option<u64>,
+        max_priority_update_size: u64,
     ) -> Stream {
         let (ty, state) = if crate::stream::is_bidi(id) {
             // All bidirectional streams are "request" streams, so we don't
@@ -245,6 +250,7 @@ impl Stream {
             trailers_received: false,
 
             max_encoded_headers_payload_size,
+            max_priority_update_size,
         }
     }
 
@@ -496,8 +502,12 @@ impl Stream {
 
             Some(frame::PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID) |
             Some(frame::PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID) => {
-                if len == 0 || len > 256 {
+                if len == 0 {
                     return Err(Error::FrameError);
+                }
+
+                if len > self.max_priority_update_size {
+                    return Err(Error::ExcessiveLoad);
                 }
 
                 (State::FramePayload, true)
@@ -895,16 +905,31 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use crate::h3::frame::*;
+    use crate::h3::PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT;
 
     use super::*;
 
     fn open_uni(b: &mut octets::OctetsMut, ty: u64) -> Result<Stream> {
-        let stream = <Stream>::new(2, false, None);
+        let stream = <Stream>::new(
+            2,
+            false,
+            None,
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        );
         assert_eq!(stream.state, State::StreamType);
 
         b.put_varint(ty)?;
 
         Ok(stream)
+    }
+
+    fn open_remote_request_stream() -> Stream {
+        Stream::new(
+            0,
+            false,
+            None,
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        )
     }
 
     fn parse_uni(
@@ -1218,7 +1243,7 @@ mod tests {
 
     #[test]
     fn request_no_data() {
-        let mut stream = <Stream>::new(0, false, None);
+        let mut stream = open_remote_request_stream();
 
         assert_eq!(stream.ty, Some(Type::Request));
         assert_eq!(stream.state, State::FrameType);
@@ -1228,7 +1253,7 @@ mod tests {
 
     #[test]
     fn request_good() {
-        let mut stream = <Stream>::new(0, false, None);
+        let mut stream = open_remote_request_stream();
 
         let mut d = vec![42; 128];
         let mut b = octets::OctetsMut::with_slice(&mut d);
@@ -1404,7 +1429,7 @@ mod tests {
 
     #[test]
     fn data_before_headers() {
-        let mut stream = <Stream>::new(0, false, None);
+        let mut stream = open_remote_request_stream();
 
         let mut d = vec![42; 128];
         let mut b = octets::OctetsMut::with_slice(&mut d);
@@ -1428,7 +1453,7 @@ mod tests {
 
     #[test]
     fn additional_headers() {
-        let mut stream = Stream::new(0, false, None);
+        let mut stream = open_remote_request_stream();
 
         let mut d = vec![42; 128];
         let mut b = octets::OctetsMut::with_slice(&mut d);
@@ -1557,7 +1582,12 @@ mod tests {
     #[test]
     fn large_headers_small_limit() {
         // Create stream with a max_field_section_size limit of 4k,
-        let mut stream = Stream::new(0, false, Some(4196), None);
+        let mut stream = Stream::new(
+            0,
+            false,
+            Some(4196),
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        );
 
         let mut d = vec![42; 20000];
         let mut b = octets::OctetsMut::with_slice(&mut d);
@@ -1603,7 +1633,12 @@ mod tests {
     #[test]
     fn large_push_promise_small_limit() {
         // Create stream with a max_field_section_size limit of 4k,
-        let mut stream = Stream::new(0, false, Some(4196), None);
+        let mut stream = Stream::new(
+            0,
+            false,
+            Some(4196),
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        );
         let mut d = vec![42; 20000];
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
@@ -1709,7 +1744,7 @@ mod tests {
         let mut d = vec![42; 128];
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
-        let mut stream = <Stream>::new(0, false, None);
+        let mut stream = open_remote_request_stream();
 
         assert_eq!(stream.ty, Some(Type::Request));
         assert_eq!(stream.state, State::FrameType);

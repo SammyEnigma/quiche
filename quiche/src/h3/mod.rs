@@ -335,6 +335,12 @@ const PRIORITY_URGENCY_UPPER_BOUND: u8 = 7;
 const PRIORITY_URGENCY_DEFAULT: u8 = 3;
 const PRIORITY_INCREMENTAL_DEFAULT: bool = false;
 
+/// The default value for the maximum size of PRIORITY_UPDATE
+/// frame payload.
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9218#section-7.2>
+pub const PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT: u64 = 256;
+
 #[cfg(feature = "qlog")]
 const QLOG_FRAME_CREATED: EventType =
     EventType::Http3EventType(Http3EventType::FrameCreated);
@@ -571,6 +577,8 @@ pub struct Config {
     /// additional settings are settings that are not part of the H3
     /// settings explicitly handled above
     additional_settings: Option<Vec<(u64, u64)>>,
+
+    max_priority_update_size: u64,
 }
 
 impl Config {
@@ -582,6 +590,8 @@ impl Config {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             additional_settings: None,
+            max_priority_update_size:
+                PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
         })
     }
 
@@ -664,6 +674,21 @@ impl Config {
         }
         self.additional_settings = Some(additional_settings);
         Ok(())
+    }
+
+    /// Sets the maximum size for the payload of PRIORITY_UPDATE frames.
+    ///
+    /// The default is [`PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT`]. The
+    /// value uses units of bytes.
+    ///
+    /// When a PRIORITY_UPDATE frame exceeds the limit set by the application,
+    /// the call to the [`poll()`] method will return the
+    /// [`Error::ExcessiveLoad`] error, and the connection will be closed.
+    ///
+    /// [`poll()`]: struct.Connection.html#method.poll
+    /// [`Error::ExcessiveLoad`]: enum.Error.html#variant.ExcessiveLoad
+    pub fn set_max_priority_update_size(&mut self, v: u64) {
+        self.max_priority_update_size = v;
     }
 }
 
@@ -989,6 +1014,8 @@ pub struct Connection {
 
     local_goaway_id: Option<u64>,
     peer_goaway_id: Option<u64>,
+
+    max_priority_update_size: u64,
 }
 
 impl Connection {
@@ -1044,6 +1071,8 @@ impl Connection {
 
             local_goaway_id: None,
             peer_goaway_id: None,
+
+            max_priority_update_size: config.max_priority_update_size,
         })
     }
 
@@ -1133,6 +1162,7 @@ impl Connection {
                 stream_id,
                 true,
                 self.local_settings.max_field_section_size,
+                self.max_priority_update_size,
             ),
         );
 
@@ -2557,6 +2587,7 @@ impl Connection {
                 stream_id,
                 false,
                 self.local_settings.max_field_section_size,
+                self.max_priority_update_size,
             )
         });
 
@@ -3241,6 +3272,7 @@ impl Connection {
                             prioritized_element_id,
                             false,
                             self.local_settings.max_field_section_size,
+                            self.max_priority_update_size,
                         )
                     });
 
@@ -5063,6 +5095,54 @@ mod tests {
 
         assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
         assert_eq!(s.poll_server(), Err(Error::Done));
+    }
+
+    #[test]
+    /// Send a PRIORITY_UPDATE for request stream from the client that is too
+    /// large.
+    fn priority_update_request_max_size_limit_default() {
+        let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
+        config.set_initial_max_data(1500);
+        config.set_initial_max_stream_data_bidi_local(1500);
+        config.set_initial_max_stream_data_bidi_remote(1500);
+        config.set_initial_max_stream_data_uni(1500);
+        config.set_initial_max_streams_bidi(5);
+        config.set_initial_max_streams_uni(5);
+        config.verify_peer(false);
+
+        let h3_config = Config::new().unwrap();
+
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+
+        s.handshake().unwrap();
+
+        let mut d = vec![42; 600];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        let pu = frame::Frame::PriorityUpdateRequest {
+            prioritized_element_id: 0,
+            priority_field_value: vec![0; 512],
+        };
+
+        pu.to_bytes(&mut b).unwrap();
+
+        s.pipe.client.stream_send(2, &d, true).unwrap();
+
+        s.advance().ok();
+
+        assert_eq!(s.poll_server(), Err(Error::ExcessiveLoad));
+
+        assert_eq!(
+            s.pipe.server.local_error.as_ref().unwrap().error_code,
+            Error::to_wire(Error::ExcessiveLoad)
+        );
     }
 
     #[test]
