@@ -341,6 +341,11 @@ const PRIORITY_INCREMENTAL_DEFAULT: bool = false;
 /// See <https://datatracker.ietf.org/doc/html/rfc9218#section-7.2>
 pub const PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT: u64 = 256;
 
+/// The default value for SETTINGS_MAX_FIELD_SECTION_SIZE
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc9114#section-4.2.2>.
+pub const SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT: u64 = 32_768;
+
 #[cfg(feature = "qlog")]
 const QLOG_FRAME_CREATED: EventType =
     EventType::Http3EventType(Http3EventType::FrameCreated);
@@ -585,7 +590,7 @@ impl Config {
     /// Creates a new configuration object with default settings.
     pub const fn new() -> Result<Config> {
         Ok(Config {
-            max_field_section_size: None,
+            max_field_section_size: Some(SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT),
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
@@ -597,10 +602,17 @@ impl Config {
 
     /// Sets the `SETTINGS_MAX_FIELD_SECTION_SIZE` setting.
     ///
-    /// By default no limit is enforced. When a request whose headers exceed
-    /// the limit set by the application is received, the call to the [`poll()`]
-    /// method will return the [`Error::ExcessiveLoad`] error, and the
-    /// connection will be closed.
+    /// The default is [`SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT`]. The value is
+    /// measured in units of bytes, it is used as a limit when parsing frames
+    /// that contain encoded HTTP headers when [`poll()`] is called. A first
+    /// check is applied when handling HEADERS and PUSH_PROMISE frames
+    /// themselves, with some margin allowed on top of the provided size. A
+    /// second check is applied when decoding QPACK, implementing the rules
+    /// described in <https://datatracker.ietf.org/doc/html/rfc9114#section-4.2.2>.
+    ///
+    /// When headers exceed the limit set by the application, the call to the
+    /// [`poll()`] method will return the [`Error::ExcessiveLoad`] error, and
+    /// the connection will be closed.
     ///
     /// [`poll()`]: struct.Connection.html#method.poll
     /// [`Error::ExcessiveLoad`]: enum.Error.html#variant.ExcessiveLoad
@@ -1161,7 +1173,9 @@ impl Connection {
             <stream::Stream>::new(
                 stream_id,
                 true,
-                self.local_settings.max_field_section_size,
+                self.local_settings
+                    .max_field_section_size
+                    .unwrap_or(SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT),
                 self.max_priority_update_size,
             ),
         );
@@ -2586,7 +2600,9 @@ impl Connection {
             <stream::Stream>::new(
                 stream_id,
                 false,
-                self.local_settings.max_field_section_size,
+                self.local_settings
+                    .max_field_section_size
+                    .unwrap_or(SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT),
                 self.max_priority_update_size,
             )
         });
@@ -3271,7 +3287,9 @@ impl Connection {
                         <stream::Stream>::new(
                             prioritized_element_id,
                             false,
-                            self.local_settings.max_field_section_size,
+                            self.local_settings.max_field_section_size.unwrap_or(
+                                SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT,
+                            ),
                             self.max_priority_update_size,
                         )
                     });
@@ -5960,8 +5978,66 @@ mod tests {
     }
 
     #[test]
-    /// Tests that the max header list size setting is enforced.
-    fn request_max_header_size_limit() {
+    /// Tests that the max header list size setting allows larger headers than
+    /// default.
+    fn request_max_header_size_limit_accepts_large_headers() {
+        let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
+        config.set_initial_max_data(150000000);
+        config.set_initial_max_stream_data_bidi_local(150000000);
+        config.set_initial_max_stream_data_bidi_remote(150000000);
+        config.set_initial_max_stream_data_uni(150000000);
+        config.set_initial_max_streams_bidi(5);
+        config.set_initial_max_streams_uni(5);
+        config.verify_peer(false);
+        config.set_initial_congestion_window_packets(100);
+
+        let mut h3_config = Config::new().unwrap();
+        h3_config.set_max_field_section_size(131072);
+
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+
+        s.handshake().unwrap();
+
+        let mut req = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":scheme", b"https"),
+            Header::new(b":authority", b"quic.tech"),
+            Header::new(b":path", b"/test"),
+        ];
+
+        for _ in 1..5000 {
+            req.push(Header::new(b"aaaaaaaaaa", b"aaaaaaaaa"));
+        }
+
+        let ev_headers = Event::Headers {
+            list: req.clone(),
+            more_frames: false,
+        };
+
+        let stream = s
+            .client
+            .send_request(&mut s.pipe.client, &req, true)
+            .unwrap();
+
+        s.advance().ok();
+
+        assert_eq!(stream, 0);
+
+        assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+    }
+
+    #[test]
+    /// Tests that the max header list size setting is enforced after decoding.
+    fn request_max_header_size_limit_decoded_field_section() {
         let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         config
             .load_cert_chain_from_pem_file("examples/cert.crt")
@@ -6001,6 +6077,53 @@ mod tests {
         s.advance().ok();
 
         assert_eq!(stream, 0);
+
+        assert_eq!(s.poll_server(), Err(Error::ExcessiveLoad));
+
+        assert_eq!(
+            s.pipe.server.local_error.as_ref().unwrap().error_code,
+            Error::to_wire(Error::ExcessiveLoad)
+        );
+    }
+
+    #[test]
+    /// Tests that the max header list size setting is enforced when observing
+    /// frame size before decode.
+    fn request_max_header_size_limit_default_abort_before_decode() {
+        let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
+        config.set_initial_max_data(150000);
+        config.set_initial_max_stream_data_bidi_local(150000);
+        config.set_initial_max_stream_data_bidi_remote(150000);
+        config.set_initial_max_stream_data_uni(150000);
+        config.set_initial_max_streams_bidi(5);
+        config.set_initial_max_streams_uni(5);
+        config.verify_peer(false);
+
+        let h3_config = Config::new().unwrap();
+
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+
+        s.handshake().unwrap();
+
+        let mut d = vec![42; 200000];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        let hdrs = frame::Frame::Headers {
+            header_block: vec![0; 65536],
+        };
+
+        hdrs.to_bytes(&mut b).unwrap();
+
+        s.pipe.client.stream_send(0, &d, true).unwrap();
+
+        s.advance().ok();
 
         assert_eq!(s.poll_server(), Err(Error::ExcessiveLoad));
 
@@ -6107,7 +6230,7 @@ mod tests {
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
         config.set_application_protos(&[b"h3"]).unwrap();
-        config.set_initial_max_data(70);
+        config.set_initial_max_data(75);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
         config.set_initial_max_stream_data_uni(150);
@@ -6170,7 +6293,7 @@ mod tests {
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
         config.set_application_protos(&[b"h3"]).unwrap();
-        config.set_initial_max_data(70);
+        config.set_initial_max_data(75);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
         config.set_initial_max_stream_data_uni(150);
@@ -6650,7 +6773,7 @@ mod tests {
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
         config.set_application_protos(&[b"h3"]).unwrap();
-        config.set_initial_max_data(69);
+        config.set_initial_max_data(74);
         config.set_initial_max_stream_data_bidi_local(150);
         config.set_initial_max_stream_data_bidi_remote(150);
         config.set_initial_max_stream_data_uni(150);
@@ -7092,11 +7215,11 @@ mod tests {
 
         assert_eq!(
             s.server.peer_settings_raw(),
-            Some(&[(42, 43), (44, 45)][..])
+            Some(&[(6, 32_768), (42, 43), (44, 45)][..])
         );
         assert_eq!(
             s.client.peer_settings_raw(),
-            Some(&[(42, 43), (44, 45)][..])
+            Some(&[(6, 32_768), (42, 43), (44, 45)][..])
         );
     }
 

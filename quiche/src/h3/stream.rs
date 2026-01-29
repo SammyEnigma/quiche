@@ -192,7 +192,7 @@ impl Stream {
     /// The `is_local` parameter indicates whether the stream was created by the
     /// local endpoint, or by the peer.
     pub fn new(
-        id: u64, is_local: bool, max_field_section_size: Option<u64>,
+        id: u64, is_local: bool, max_field_section_size: u64,
         max_priority_update_size: u64,
     ) -> Stream {
         let (ty, state) = if crate::stream::is_bidi(id) {
@@ -204,16 +204,11 @@ impl Stream {
             (None, State::StreamType)
         };
 
-        let max_encoded_headers_payload_size = match max_field_section_size {
-            // Huffman encoding might inflate the size of encoded headers
-            // when transferred in HEADERS or PUSH_PROMISE frames. Scale up
-            // the limit by 50% to accommodate this.
-            Some(v) => (v as f64 * HUFFMAN_FRAME_SIZE_MARGIN_FACTOR) as u64,
-
-            // Use "infinite" as default value for max_field_section_size if it is
-            // not configured by the application.
-            None => u64::MAX,
-        };
+        // Huffman encoding might inflate the size of encoded headers
+        // when transferred in HEADERS or PUSH_PROMISE frames. Scale up
+        // the limit by 50% to accommodate this.
+        let max_encoded_headers_payload_size =
+            max_field_section_size.saturating_add(max_field_section_size / 2);
 
         Stream {
             id,
@@ -906,6 +901,7 @@ impl Stream {
 mod tests {
     use crate::h3::frame::*;
     use crate::h3::PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT;
+    use crate::h3::SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT;
 
     use super::*;
 
@@ -913,7 +909,7 @@ mod tests {
         let stream = <Stream>::new(
             2,
             false,
-            None,
+            SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
         );
         assert_eq!(stream.state, State::StreamType);
@@ -927,7 +923,7 @@ mod tests {
         Stream::new(
             0,
             false,
-            None,
+            SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
         )
     }
@@ -1585,7 +1581,7 @@ mod tests {
         let mut stream = Stream::new(
             0,
             false,
-            Some(4196),
+            4196,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
         );
 
@@ -1636,7 +1632,7 @@ mod tests {
         let mut stream = Stream::new(
             0,
             false,
-            Some(4196),
+            4196,
             PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
         );
         let mut d = vec![42; 20000];
