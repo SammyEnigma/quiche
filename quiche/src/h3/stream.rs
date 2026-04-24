@@ -24,6 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::mem::MaybeUninit;
+
 use crate::buffers::BufFactory;
 
 use super::Error;
@@ -37,6 +39,7 @@ pub const QPACK_ENCODER_STREAM_TYPE_ID: u64 = 0x2;
 pub const QPACK_DECODER_STREAM_TYPE_ID: u64 = 0x3;
 
 const MAX_STATE_BUF_SIZE: usize = (1 << 24) - 1;
+const MAX_STATE_BUF_ALLOC_SIZE: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Type {
     Control,
@@ -217,7 +220,7 @@ impl Stream {
             state,
 
             // Pre-allocate a buffer to avoid multiple tiny early allocations.
-            state_buf: vec![0; 16],
+            state_buf: Vec::with_capacity(16),
 
             // Expect one byte for the initial state, to parse the initial
             // varint length.
@@ -523,6 +526,50 @@ impl Stream {
         Ok(())
     }
 
+    /// Returns a mutable slice over the state buffer's spare capacity,
+    /// reserving additional space if needed.
+    ///
+    /// Callers must initialize the returned bytes and call
+    /// [`commit_state_buf_read()`] with the number of bytes written.
+    fn spare_state_buf(&mut self) -> &mut [u8] {
+        let need = self.state_len - self.state_off;
+        let spare = self
+            .state_buf
+            .capacity()
+            .saturating_sub(self.state_buf.len());
+
+        if spare == 0 {
+            let additional = std::cmp::min(MAX_STATE_BUF_ALLOC_SIZE, need);
+            self.state_buf.reserve(additional);
+        }
+
+        let buf = self.state_buf.spare_capacity_mut();
+        let usable = std::cmp::min(need, buf.len());
+
+        // SAFETY: MaybeUninit<u8> has the same layout as u8. The caller
+        // contract requires initializing all returned bytes before calling
+        // commit_state_buf_read(), so no uninitialized memory is read.
+        unsafe {
+            std::mem::transmute::<&mut [MaybeUninit<u8>], &mut [u8]>(
+                &mut buf[..usable],
+            )
+        }
+    }
+
+    /// Advances the state buffer's initialized length and offset by `read`
+    /// bytes. The caller must have written `read` bytes into the slice
+    /// previously returned by [`spare_state_buf()`].
+    fn commit_state_buf_read(&mut self, read: usize) {
+        let buf_len = self.state_buf.len();
+        debug_assert!(buf_len + read <= self.state_buf.capacity());
+        // SAFETY: `read` bytes were written to spare capacity by the I/O
+        // layer. read <= spare_buf.len() <= spare_capacity, so
+        // buf_len + read <= capacity.
+        unsafe { self.state_buf.set_len(buf_len + read) };
+
+        self.state_off += read;
+    }
+
     /// Tries to fill the state buffer by reading data from the corresponding
     /// transport stream.
     ///
@@ -536,43 +583,55 @@ impl Stream {
             return Ok(());
         }
 
-        let buf = &mut self.state_buf[self.state_off..self.state_len];
+        loop {
+            let stream_id = self.id;
 
-        let read = match conn.stream_recv(self.id, buf) {
-            Ok((len, fin)) => {
-                if self.critical_stream_closed(fin) {
-                    super::close_conn_critical_stream(conn)?;
-                }
+            let spare_buf = self.spare_state_buf();
+            let spare_len = spare_buf.len();
 
-                len
-            },
+            match conn.stream_recv(stream_id, spare_buf) {
+                Ok((read, fin)) => {
+                    self.commit_state_buf_read(read);
 
-            Err(e @ crate::Error::StreamReset(_)) => {
-                if self.critical_stream_closed(true) {
-                    super::close_conn_critical_stream(conn)?;
-                }
+                    if self.critical_stream_closed(fin) {
+                        super::close_conn_critical_stream(conn)?;
+                    }
 
-                return Err(e.into());
-            },
+                    trace!(
+                        "{} read {} bytes on stream {}",
+                        conn.trace_id(),
+                        read,
+                        self.id,
+                    );
 
-            Err(e) => {
-                // The stream is not readable anymore, so re-arm the Data event.
-                if e == crate::Error::Done {
-                    self.reset_data_event();
-                }
+                    if read < spare_len {
+                        break;
+                    }
 
-                return Err(e.into());
-            },
-        };
+                    if self.state_buffer_complete() {
+                        return Ok(());
+                    }
+                },
 
-        trace!(
-            "{} read {} bytes on stream {}",
-            conn.trace_id(),
-            read,
-            self.id,
-        );
+                Err(e @ crate::Error::StreamReset(_)) => {
+                    if self.critical_stream_closed(true) {
+                        super::close_conn_critical_stream(conn)?;
+                    }
 
-        self.state_off += read;
+                    return Err(e.into());
+                },
+
+                Err(e) => {
+                    // The stream is not readable anymore, so re-arm the Data
+                    // event.
+                    if e == crate::Error::Done {
+                        self.reset_data_event();
+                    }
+
+                    return Err(e.into());
+                },
+            };
+        }
 
         if !self.state_buffer_complete() {
             self.reset_data_event();
@@ -694,11 +753,33 @@ impl Stream {
             return Ok(());
         }
 
-        let buf = &mut self.state_buf[self.state_off..self.state_len];
+        loop {
+            let spare_buf = self.spare_state_buf();
+            let spare_len = spare_buf.len();
 
-        let read = std::io::Read::read(stream, buf).unwrap();
+            let read = match std::io::Read::read(stream, spare_buf) {
+                Ok(0) => {
+                    // end of stream, stop
+                    break;
+                },
 
-        self.state_off += read;
+                Ok(v) => v,
+
+                Err(_) => {
+                    panic!("Test buffer reading should never fail");
+                },
+            };
+
+            self.commit_state_buf_read(read);
+
+            if read < spare_len {
+                break;
+            }
+
+            if self.state_buffer_complete() {
+                break;
+            }
+        }
 
         if !self.state_buffer_complete() {
             return Err(Error::Done);
@@ -711,7 +792,7 @@ impl Stream {
     pub fn try_consume_varint(&mut self) -> Result<u64> {
         if self.state_off == 1 {
             self.state_len = octets::varint_parse_len(self.state_buf[0]);
-            self.state_buf.resize(self.state_len, 0);
+            self.state_buf.reserve(self.state_len);
         }
 
         // Return early if we don't have enough data in the state buffer to
@@ -876,6 +957,8 @@ impl Stream {
     fn state_transition(
         &mut self, new_state: State, expected_len: usize, resize: bool,
     ) -> Result<()> {
+        self.state_buf.clear();
+
         // Some states don't need the state buffer, so don't resize it if not
         // necessary.
         if resize {
@@ -886,7 +969,9 @@ impl Stream {
                 return Err(Error::ExcessiveLoad);
             }
 
-            self.state_buf.resize(expected_len, 0);
+            let reserve_len =
+                std::cmp::min(expected_len, MAX_STATE_BUF_ALLOC_SIZE);
+            self.state_buf.reserve(reserve_len);
         }
 
         self.state = new_state;
@@ -938,6 +1023,18 @@ mod tests {
         stream.set_ty(Type::deserialize(stream_ty).unwrap())?;
 
         Ok(())
+    }
+
+    /// Fill the buffer and parse a multi-byte varint that requires two
+    /// fills (the first read gets the length prefix, the second gets the
+    /// remaining bytes).
+    fn parse_multibyte_varint(
+        stream: &mut Stream, cursor: &mut std::io::Cursor<Vec<u8>>,
+    ) -> Result<u64> {
+        stream.try_fill_buffer_for_tests(cursor)?;
+        assert_eq!(stream.try_consume_varint(), Err(Error::Done));
+        stream.try_fill_buffer_for_tests(cursor)?;
+        stream.try_consume_varint()
     }
 
     fn parse_skip_frame(
@@ -1575,88 +1672,238 @@ mod tests {
         assert_eq!(stream.state, State::FrameType);
     }
 
-    #[test]
-    fn large_headers_small_limit() {
-        // Create stream with a max_field_section_size limit of 4k,
-        let mut stream = Stream::new(
-            0,
-            false,
-            4196,
-            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
-        );
-
-        let mut d = vec![42; 20000];
-        let mut b = octets::OctetsMut::with_slice(&mut d);
-
-        // Encoded headers at 16k are larger than the 4k limit.
-        let header_block = vec![0; 16384];
-        let hdrs = Frame::Headers {
-            header_block: header_block.clone(),
-        };
-
-        hdrs.to_bytes(&mut b).unwrap();
-
-        let mut cursor = std::io::Cursor::new(d);
-
-        // Parse the HEADERS frame type.
-        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
-
-        let frame_ty = stream.try_consume_varint().unwrap();
-        assert_eq!(frame_ty, HEADERS_FRAME_TYPE_ID);
-
-        stream.set_frame_type(frame_ty).unwrap();
-        assert_eq!(stream.state, State::FramePayloadLen);
-
-        // Parse the HEADERS frame payload length.
-        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
-
-        // Parse fails because we need more bytes for the 4-byte encoded length.
-        // This trial then sets the expected buffer size for us to fill.
-        assert_eq!(stream.try_consume_varint(), Err(Error::Done));
-        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
-
-        let frame_payload_len = stream.try_consume_varint().unwrap();
-        assert_eq!(frame_payload_len, 16384);
-
-        // Once the frame length has been determined, we reject the frame
-        // because it is too large.
-        assert_eq!(
-            stream.set_frame_payload_len(frame_payload_len),
-            Err(Error::ExcessiveLoad)
-        );
+    /// Returns the frame type ID for a given frame variant.
+    fn frame_type_id(frame: &Frame) -> u64 {
+        match frame {
+            Frame::Data { .. } => DATA_FRAME_TYPE_ID,
+            Frame::Headers { .. } => HEADERS_FRAME_TYPE_ID,
+            Frame::CancelPush { .. } => CANCEL_PUSH_FRAME_TYPE_ID,
+            Frame::Settings { .. } => SETTINGS_FRAME_TYPE_ID,
+            Frame::PushPromise { .. } => PUSH_PROMISE_FRAME_TYPE_ID,
+            Frame::GoAway { .. } => GOAWAY_FRAME_TYPE_ID,
+            Frame::MaxPushId { .. } => MAX_PUSH_FRAME_TYPE_ID,
+            Frame::PriorityUpdateRequest { .. } =>
+                PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID,
+            Frame::PriorityUpdatePush { .. } =>
+                PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID,
+            Frame::Unknown { .. } => unreachable!(),
+        }
     }
 
-    #[test]
-    fn large_push_promise_small_limit() {
-        // Create stream with a max_field_section_size limit of 4k,
-        let mut stream = Stream::new(
-            0,
-            false,
-            4196,
-            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
-        );
+    /// Parse a large frame and check the size limit behavior.
+    ///
+    /// Writes the frame to a buffer, parses the frame type and payload
+    /// length (handling multi-byte varint retry), then checks whether
+    /// `set_frame_payload_len` accepts or rejects the frame. If accepted,
+    /// also parses the payload and verifies `try_consume_frame` output.
+    ///
+    /// - `stream`: the H3 stream to parse the frame on.
+    /// - `frame`: the frame to encode and parse back.
+    /// - `expected_payload_len`: the expected encoded payload length.
+    /// - `expect_accept`: if true, the frame should be accepted and fully
+    ///   parsed; if false, `set_frame_payload_len` should reject it with
+    ///   `Error::ExcessiveLoad`.
+    fn check_large_frame_size_limit(
+        stream: &mut Stream, frame: Frame, expected_payload_len: u64,
+        expect_accept: bool,
+    ) {
+        let expected_type_id = frame_type_id(&frame);
+
         let mut d = vec![42; 20000];
         let mut b = octets::OctetsMut::with_slice(&mut d);
-
-        let header_block = vec![0; 16384];
-        let pp = Frame::PushPromise {
-            push_id: 0,
-            header_block: header_block.clone(),
-        };
-
-        pp.to_bytes(&mut b).unwrap();
-
+        frame.to_bytes(&mut b).unwrap();
         let mut cursor = std::io::Cursor::new(d);
 
         // Parse frame type.
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
         let frame_ty = stream.try_consume_varint().unwrap();
-        assert_eq!(frame_ty, PUSH_PROMISE_FRAME_TYPE_ID);
+        assert_eq!(frame_ty, expected_type_id);
 
         stream.set_frame_type(frame_ty).unwrap();
         assert_eq!(stream.state, State::FramePayloadLen);
 
         // Parse frame payload length.
+        let frame_payload_len =
+            parse_multibyte_varint(stream, &mut cursor).unwrap();
+        assert_eq!(frame_payload_len, expected_payload_len);
+
+        if expect_accept {
+            stream.set_frame_payload_len(frame_payload_len).unwrap();
+            assert_eq!(stream.state, State::FramePayload);
+
+            stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+
+            assert_eq!(
+                stream.try_consume_frame(),
+                Ok((frame, expected_payload_len))
+            );
+            assert_eq!(stream.state, State::FrameType);
+        } else {
+            assert_eq!(
+                stream.set_frame_payload_len(frame_payload_len),
+                Err(Error::ExcessiveLoad)
+            );
+        }
+    }
+
+    #[test]
+    fn large_headers_default_limit() {
+        let mut stream = open_remote_request_stream();
+        let header_block = vec![0; 16384];
+        let frame = Frame::Headers {
+            header_block: header_block.clone(),
+        };
+
+        check_large_frame_size_limit(&mut stream, frame, 16384, true);
+    }
+
+    #[test]
+    fn large_headers_limit_with_huffman() {
+        // Create stream with a max_field_section_size limit of 4k.
+        let mut stream = Stream::new(
+            0,
+            false,
+            4196,
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        );
+
+        // Size the header block so it will fit within the Huffman margin.
+        // On this branch the margin is x + x/2 = 4196 + 2098 = 6294.
+        let header_block = vec![0; 6294];
+        let frame = Frame::Headers {
+            header_block: header_block.clone(),
+        };
+
+        check_large_frame_size_limit(&mut stream, frame, 6294, true);
+    }
+
+    #[test]
+    fn large_headers_small_limit() {
+        // Create stream with a max_field_section_size limit of 4k.
+        // Encoded headers at 16k are larger than the 4k limit.
+        let mut stream = Stream::new(
+            0,
+            false,
+            4196,
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        );
+        let header_block = vec![0; 16384];
+        let frame = Frame::Headers {
+            header_block: header_block.clone(),
+        };
+
+        check_large_frame_size_limit(&mut stream, frame, 16384, false);
+    }
+
+    #[test]
+    fn large_push_promise_default_limit() {
+        let mut stream = open_remote_request_stream();
+        let header_block = vec![0; 16384];
+        let frame = Frame::PushPromise {
+            push_id: 0,
+            header_block: header_block.clone(),
+        };
+
+        check_large_frame_size_limit(&mut stream, frame, 1 + 16384, true);
+    }
+
+    #[test]
+    fn large_push_promise_limit_with_huffman() {
+        // Create stream with a max_field_section_size limit of 4k.
+        let mut stream = Stream::new(
+            0,
+            false,
+            4196,
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        );
+
+        // Size the header block so it will fit within the Huffman margin.
+        // On this branch the margin is x + x/2 = 4196 + 2098 = 6294.
+        let header_block = vec![0; 6294];
+        let frame = Frame::PushPromise {
+            push_id: 0,
+            header_block: header_block.clone(),
+        };
+
+        check_large_frame_size_limit(&mut stream, frame, 1 + 6294, true);
+    }
+
+    #[test]
+    fn large_push_promise_small_limit() {
+        // Create stream with a max_field_section_size limit of 4k.
+        // Encoded push promise at 16k is larger than the 4k limit.
+        let mut stream = Stream::new(
+            0,
+            false,
+            4196,
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        );
+        let header_block = vec![0; 16384];
+        let frame = Frame::PushPromise {
+            push_id: 0,
+            header_block: header_block.clone(),
+        };
+
+        check_large_frame_size_limit(&mut stream, frame, 1 + 16384, false);
+    }
+
+    #[test]
+    fn large_priority_update_large_limit() {
+        let settings = Frame::Settings {
+            max_field_section_size: None,
+            qpack_max_table_capacity: None,
+            qpack_blocked_streams: None,
+            connect_protocol_enabled: None,
+            h3_datagram: None,
+            grease: None,
+            additional_settings: None,
+            raw: Some(vec![]),
+        };
+
+        let mut d = vec![42; 20000];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        // Control stream needs a SETTINGS frame to transition it into
+        // being able to parse other frame types.
+        let mut stream = <Stream>::new(
+            2,
+            false,
+            SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT,
+            20000,
+        );
+        b.put_varint(HTTP3_CONTROL_STREAM_TYPE_ID).unwrap();
+        settings.to_bytes(&mut b).unwrap();
+
+        let priority_field_value = vec![0; 16384];
+        let pu = Frame::PriorityUpdateRequest {
+            prioritized_element_id: 0,
+            priority_field_value,
+        };
+
+        pu.to_bytes(&mut b).unwrap();
+
+        let mut cursor = std::io::Cursor::new(d);
+
+        parse_uni(&mut stream, HTTP3_CONTROL_STREAM_TYPE_ID, &mut cursor)
+            .unwrap();
+
+        // Skip SETTINGS frame type.
+        parse_skip_frame(&mut stream, &mut cursor).unwrap();
+
+        // Parse the frame type.
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+
+        // Parse fails because we need more bytes for the 4-byte encoded length.
+        // This trial then sets the expected buffer size for us to fill.
+        assert_eq!(stream.try_consume_varint(), Err(Error::Done));
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+        let frame_ty = stream.try_consume_varint().unwrap();
+        assert_eq!(frame_ty, PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID);
+
+        stream.set_frame_type(frame_ty).unwrap();
+        assert_eq!(stream.state, State::FramePayloadLen);
+
+        // Parse the frame payload length.
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
 
         // Parse fails because we need more bytes for the 4-byte encoded length.
@@ -1665,10 +1912,82 @@ mod tests {
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
 
         let frame_payload_len = stream.try_consume_varint().unwrap();
-        assert_eq!(frame_payload_len, 1 + 16384); // Encoded push ID plus header block
+        assert_eq!(frame_payload_len, 1 + 16384);
 
-        // Once the frame length has been determined, we reject the frame
-        // because it is too large.
+        stream.set_frame_payload_len(frame_payload_len).unwrap();
+        assert_eq!(stream.state, State::FramePayload);
+
+        // Parse the frame.
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+
+        assert_eq!(stream.try_consume_frame(), Ok((pu, 1 + 16384)));
+        assert_eq!(stream.state, State::FrameType);
+    }
+
+    #[test]
+    fn large_priority_update_small_limit() {
+        let settings = Frame::Settings {
+            max_field_section_size: None,
+            qpack_max_table_capacity: None,
+            qpack_blocked_streams: None,
+            connect_protocol_enabled: None,
+            h3_datagram: None,
+            grease: None,
+            additional_settings: None,
+            raw: Some(vec![]),
+        };
+
+        let mut d = vec![42; 20000];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        // Control stream needs a SETTINGS frame to transition it into
+        // being able to parse other frame types.
+        let mut stream =
+            <Stream>::new(2, false, SETTINGS_MAX_FIELD_SECTION_SIZE_DEFAULT, 123);
+        b.put_varint(HTTP3_CONTROL_STREAM_TYPE_ID).unwrap();
+
+        settings.to_bytes(&mut b).unwrap();
+
+        let priority_field_value = vec![0; 16384];
+        let pu = Frame::PriorityUpdateRequest {
+            prioritized_element_id: 0,
+            priority_field_value,
+        };
+
+        pu.to_bytes(&mut b).unwrap();
+
+        let mut cursor = std::io::Cursor::new(d);
+
+        parse_uni(&mut stream, HTTP3_CONTROL_STREAM_TYPE_ID, &mut cursor)
+            .unwrap();
+
+        // Skip SETTINGS frame type.
+        parse_skip_frame(&mut stream, &mut cursor).unwrap();
+
+        // Parse the frame type.
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+
+        // Parse fails because we need more bytes for the 4-byte encoded length.
+        // This trial then sets the expected buffer size for us to fill.
+        assert_eq!(stream.try_consume_varint(), Err(Error::Done));
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+        let frame_ty = stream.try_consume_varint().unwrap();
+        assert_eq!(frame_ty, PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID);
+
+        stream.set_frame_type(frame_ty).unwrap();
+        assert_eq!(stream.state, State::FramePayloadLen);
+
+        // Parse the frame payload length.
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+
+        // Parse fails because we need more bytes for the 4-byte encoded length.
+        // This trial then sets the expected buffer size for us to fill.
+        assert_eq!(stream.try_consume_varint(), Err(Error::Done));
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+
+        let frame_payload_len = stream.try_consume_varint().unwrap();
+        assert_eq!(frame_payload_len, 1 + 16384);
+
         assert_eq!(
             stream.set_frame_payload_len(frame_payload_len),
             Err(Error::ExcessiveLoad)
@@ -1766,5 +2085,383 @@ mod tests {
             Err(Error::FrameError),
             stream.set_frame_payload_len(frame_payload_len)
         );
+    }
+
+    #[test]
+    /// Drip feed data in chunks that exactly match spare capacity, forcing
+    /// spare to hit 0 on every re-entry to try_fill_buffer_for_tests.
+    fn large_state_buf_exact_spare_drip_feed() {
+        const LARGE_HEADER_LEN: usize = 16384;
+        let mut stream = Stream::new(
+            0,
+            false,
+            LARGE_HEADER_LEN as u64,
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        );
+
+        let mut d = vec![42; 20000];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        // Use nonzero fill to catch off-by-one errors in payload offset.
+        let header_block = vec![0xAB; LARGE_HEADER_LEN];
+        let hdrs = Frame::Headers {
+            header_block: header_block.clone(),
+        };
+
+        hdrs.to_bytes(&mut b).unwrap();
+
+        let mut cursor = std::io::Cursor::new(d);
+
+        // Parse frame type.
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+        let frame_ty = stream.try_consume_varint().unwrap();
+        assert_eq!(frame_ty, HEADERS_FRAME_TYPE_ID);
+        stream.set_frame_type(frame_ty).unwrap();
+
+        // Parse frame payload length.
+        let frame_payload_len =
+            parse_multibyte_varint(&mut stream, &mut cursor).unwrap();
+        assert_eq!(frame_payload_len, LARGE_HEADER_LEN as u64);
+
+        stream.set_frame_payload_len(frame_payload_len).unwrap();
+        assert_eq!(stream.state, State::FramePayload);
+
+        // After state transition, initial reserve gives us
+        // MAX_STATE_BUF_ALLOC_SIZE of spare capacity.
+        assert_eq!(stream.state_buf.capacity(), MAX_STATE_BUF_ALLOC_SIZE);
+        assert_eq!(stream.state_buf.len(), 0);
+
+        // Save the full cursor data then replace with an empty one so we
+        // can drip feed exact amounts.
+        let full_data = cursor.into_inner();
+        let pos = 5; // 1 byte frame type + 4 byte varint (16384 >= 2^14)
+        let payload_data = &full_data[pos..pos + LARGE_HEADER_LEN];
+
+        // Drip feed in chunks that exactly match MAX_STATE_BUF_ALLOC_SIZE.
+        // Each chunk fully consumes spare, so on re-entry spare is exactly 0
+        // and spare_state_buf must reserve.
+        let mut fed = 0;
+        while fed + MAX_STATE_BUF_ALLOC_SIZE <= LARGE_HEADER_LEN {
+            let chunk = &payload_data[fed..fed + MAX_STATE_BUF_ALLOC_SIZE];
+            let mut chunk_cursor = std::io::Cursor::new(chunk.to_vec());
+
+            let result = stream.try_fill_buffer_for_tests(&mut chunk_cursor);
+
+            fed += MAX_STATE_BUF_ALLOC_SIZE;
+
+            if fed < LARGE_HEADER_LEN {
+                assert_eq!(result, Err(Error::Done));
+                assert_eq!(stream.state_off, fed);
+                // spare_state_buf should have reserved on each re-entry
+                // since previous chunk consumed all spare.
+                assert!(stream.state_buf.capacity() >= fed);
+            } else {
+                assert_eq!(result, Ok(()));
+                assert_eq!(stream.state_off, LARGE_HEADER_LEN);
+            }
+        }
+
+        assert_eq!(
+            stream.try_consume_frame(),
+            Ok((hdrs, LARGE_HEADER_LEN as u64))
+        );
+        assert_eq!(stream.state, State::FrameType);
+    }
+
+    #[test]
+    /// Drip feed data in chunks smaller than spare capacity, so spare is
+    /// small but nonzero on re-entry. Verifies that the buffer eventually
+    /// grows when spare is fully consumed across multiple small reads.
+    fn large_state_buf_small_leftover_spare() {
+        const LARGE_HEADER_LEN: usize = 260000;
+        let mut stream = Stream::new(
+            0,
+            false,
+            LARGE_HEADER_LEN as u64,
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        );
+
+        let mut d = vec![42; LARGE_HEADER_LEN + 10];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        let header_block = vec![0; LARGE_HEADER_LEN];
+        let hdrs = Frame::Headers {
+            header_block: header_block.clone(),
+        };
+
+        hdrs.to_bytes(&mut b).unwrap();
+
+        let mut cursor = std::io::Cursor::new(d);
+
+        // Parse frame type.
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+        let frame_ty = stream.try_consume_varint().unwrap();
+        assert_eq!(frame_ty, HEADERS_FRAME_TYPE_ID);
+        stream.set_frame_type(frame_ty).unwrap();
+
+        // Parse frame payload length.
+        let frame_payload_len =
+            parse_multibyte_varint(&mut stream, &mut cursor).unwrap();
+        assert_eq!(frame_payload_len, LARGE_HEADER_LEN as u64);
+
+        stream.set_frame_payload_len(frame_payload_len).unwrap();
+        assert_eq!(stream.state, State::FramePayload);
+        assert_eq!(stream.state_buf.capacity(), MAX_STATE_BUF_ALLOC_SIZE);
+
+        let full_data = cursor.into_inner();
+        let pos = 5; // 1 byte frame type + 4 byte varint length
+        let payload_data = &full_data[pos..pos + LARGE_HEADER_LEN];
+
+        // Drip feed 1000-byte chunks. These don't align with the 4096 spare
+        // capacity, so spare will be nonzero but shrinking on each re-entry
+        // until it hits 0 and forces a reserve.
+        let chunk_size = 1000;
+        let mut fed = 0;
+        while fed < LARGE_HEADER_LEN {
+            let end = std::cmp::min(fed + chunk_size, LARGE_HEADER_LEN);
+            let chunk = &payload_data[fed..end];
+            let mut chunk_cursor = std::io::Cursor::new(chunk.to_vec());
+
+            let result = stream.try_fill_buffer_for_tests(&mut chunk_cursor);
+
+            fed = end;
+
+            if fed < LARGE_HEADER_LEN {
+                assert_eq!(result, Err(Error::Done));
+                assert_eq!(stream.state_off, fed);
+                // Capacity must always be at least as large as what we've
+                // buffered.
+                assert!(stream.state_buf.capacity() >= stream.state_buf.len());
+                // Capacity should grow incrementally. The allocator may
+                // over-allocate (typically doubling), so we allow up to
+                // 2x (bytes_read + reserve_size) to account for that.
+                // The key property: capacity never jumps to the full
+                // frame size before we've read a proportional amount.
+                assert!(
+                    stream.state_buf.capacity() <=
+                        (fed + MAX_STATE_BUF_ALLOC_SIZE) * 2,
+                    "capacity {} grew too far ahead of bytes read {} \
+                     (max alloc size {})",
+                    stream.state_buf.capacity(),
+                    fed,
+                    MAX_STATE_BUF_ALLOC_SIZE,
+                );
+            } else {
+                assert_eq!(result, Ok(()));
+            }
+        }
+
+        assert_eq!(
+            stream.try_consume_frame(),
+            Ok((hdrs, LARGE_HEADER_LEN as u64))
+        );
+        assert_eq!(stream.state, State::FrameType);
+    }
+
+    #[test]
+    fn large_state_buf_allocation() {
+        const LARGE_HEADER_LEN: usize = 260000;
+        let mut stream = Stream::new(
+            0,
+            false,
+            LARGE_HEADER_LEN as u64,
+            PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+        );
+        assert_eq!(stream.state_buf.capacity(), 16);
+
+        let mut d = vec![42; 5];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        // Drip feed a large HEADERS frame into the "stream"
+        b.put_varint(HEADERS_FRAME_TYPE_ID).unwrap();
+        b.put_varint(LARGE_HEADER_LEN as u64).unwrap();
+
+        let mut cursor = std::io::Cursor::new(d);
+
+        // Parse the HEADERS frame type.
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+        assert_eq!(stream.state_buf.capacity(), 16);
+
+        let frame_ty = stream.try_consume_varint().unwrap();
+        assert_eq!(frame_ty, HEADERS_FRAME_TYPE_ID);
+        assert_eq!(stream.state_buf.capacity(), 16);
+
+        stream.set_frame_type(frame_ty).unwrap();
+        assert_eq!(stream.state_buf.capacity(), 16);
+
+        // Parse the HEADERS frame payload length.
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+        assert_eq!(stream.state_buf.capacity(), 16);
+
+        // Parse fails because we need more bytes for the 4-byte encoded length.
+        // This trial then sets the expected buffer size for us to fill.
+        assert_eq!(stream.try_consume_varint(), Err(Error::Done));
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
+        assert_eq!(stream.state_buf.capacity(), 16);
+
+        let frame_payload_len = stream.try_consume_varint().unwrap();
+        assert_eq!(frame_payload_len, LARGE_HEADER_LEN as u64);
+        assert_eq!(stream.state_buf.capacity(), 16);
+
+        stream.set_frame_payload_len(frame_payload_len).unwrap();
+        assert_eq!(stream.state_buf.capacity(), MAX_STATE_BUF_ALLOC_SIZE);
+
+        /// Assert state_len, state_off, and state_buf.capacity() in one
+        /// call, with labeled messages on failure.
+        fn assert_state_buf_props(
+            stream: &Stream, len: usize, off: usize, capacity: usize,
+        ) {
+            assert_eq!(stream.state_len, len, "state_len");
+            assert_eq!(stream.state_off, off, "state_off");
+            assert_eq!(stream.state_buf.capacity(), capacity, "capacity");
+        }
+
+        // Start consuming HEADERS frame payload. It fails because the cursor
+        // doesn't have the target size of data in it.
+        assert_eq!(
+            stream.try_fill_buffer_for_tests(&mut cursor),
+            Err(Error::Done)
+        );
+        assert_state_buf_props(
+            &stream,
+            LARGE_HEADER_LEN,
+            0,
+            MAX_STATE_BUF_ALLOC_SIZE,
+        );
+
+        // Drip feed data into the cursor to emulate a series of transport
+        // reads. After set_frame_payload_len, the initial reserve gives us
+        // MAX_STATE_BUF_ALLOC_SIZE (4096) bytes of spare capacity.
+
+        // Feed 2048 bytes: fits within the 4096 spare, no growth needed.
+        cursor.get_mut().extend_from_slice(&[123; 2048]);
+        assert_eq!(
+            stream.try_fill_buffer_for_tests(&mut cursor),
+            Err(Error::Done)
+        );
+        assert_state_buf_props(
+            &stream,
+            LARGE_HEADER_LEN,
+            2048,
+            MAX_STATE_BUF_ALLOC_SIZE,
+        );
+
+        // Feed 1024 bytes: still fits in the remaining 2048 spare.
+        cursor.get_mut().extend_from_slice(&[123; 1024]);
+        assert_eq!(
+            stream.try_fill_buffer_for_tests(&mut cursor),
+            Err(Error::Done)
+        );
+        assert_state_buf_props(
+            &stream,
+            LARGE_HEADER_LEN,
+            3072,
+            MAX_STATE_BUF_ALLOC_SIZE,
+        );
+
+        // Feed 512 bytes: fits in the remaining 1024 spare. Capacity
+        // between state_off 4096 and 6144 stays stable because spare
+        // doesn't hit 0.
+        cursor.get_mut().extend_from_slice(&[123; 512]);
+        assert_eq!(
+            stream.try_fill_buffer_for_tests(&mut cursor),
+            Err(Error::Done)
+        );
+        assert_state_buf_props(
+            &stream,
+            LARGE_HEADER_LEN,
+            3584,
+            MAX_STATE_BUF_ALLOC_SIZE,
+        );
+
+        // Feed 4096 bytes: exceeds the remaining 512 spare. The loop reads
+        // 512 to fill spare, then spare hits 0, triggers a reserve of
+        // MAX_STATE_BUF_ALLOC_SIZE (4096), and reads the remaining 3584.
+        // The allocator doubles capacity from 4096 to 8192.
+        cursor.get_mut().extend_from_slice(&[123; 4096]);
+        assert_eq!(
+            stream.try_fill_buffer_for_tests(&mut cursor),
+            Err(Error::Done)
+        );
+        assert_state_buf_props(
+            &stream,
+            LARGE_HEADER_LEN,
+            7680,
+            MAX_STATE_BUF_ALLOC_SIZE * 2,
+        );
+
+        // Each subsequent feed exceeds spare (512 after the previous
+        // reserve+read), so the loop drains the leftover spare, hits 0,
+        // reserves MAX_STATE_BUF_ALLOC_SIZE, and the allocator doubles.
+        cursor.get_mut().extend_from_slice(&[123; 8192]);
+        assert_eq!(
+            stream.try_fill_buffer_for_tests(&mut cursor),
+            Err(Error::Done)
+        );
+        assert_state_buf_props(
+            &stream,
+            LARGE_HEADER_LEN,
+            15872,
+            MAX_STATE_BUF_ALLOC_SIZE * 4,
+        );
+
+        cursor.get_mut().extend_from_slice(&[123; 16384]);
+        assert_eq!(
+            stream.try_fill_buffer_for_tests(&mut cursor),
+            Err(Error::Done)
+        );
+        assert_state_buf_props(
+            &stream,
+            LARGE_HEADER_LEN,
+            32256,
+            MAX_STATE_BUF_ALLOC_SIZE * 8,
+        );
+
+        cursor.get_mut().extend_from_slice(&[123; 32768]);
+        assert_eq!(
+            stream.try_fill_buffer_for_tests(&mut cursor),
+            Err(Error::Done)
+        );
+        assert_state_buf_props(
+            &stream,
+            LARGE_HEADER_LEN,
+            65024,
+            MAX_STATE_BUF_ALLOC_SIZE * 16,
+        );
+
+        cursor.get_mut().extend_from_slice(&[123; 65536]);
+        assert_eq!(
+            stream.try_fill_buffer_for_tests(&mut cursor),
+            Err(Error::Done)
+        );
+        assert_state_buf_props(
+            &stream,
+            LARGE_HEADER_LEN,
+            130560,
+            MAX_STATE_BUF_ALLOC_SIZE * 32,
+        );
+
+        // Feed the remaining bytes to complete the frame.
+        let remaining = LARGE_HEADER_LEN - 130560;
+        cursor.get_mut().extend_from_slice(&vec![123; remaining]);
+        assert_eq!(stream.try_fill_buffer_for_tests(&mut cursor), Ok(()));
+        assert_state_buf_props(
+            &stream,
+            LARGE_HEADER_LEN,
+            LARGE_HEADER_LEN,
+            MAX_STATE_BUF_ALLOC_SIZE * 64,
+        );
+
+        let header_block = vec![123; LARGE_HEADER_LEN];
+        let hdrs = Frame::Headers {
+            header_block: header_block.clone(),
+        };
+        assert_eq!(
+            stream.try_consume_frame(),
+            Ok((hdrs, LARGE_HEADER_LEN as u64))
+        );
+        assert_eq!(stream.state, State::FrameType);
+
+        assert_state_buf_props(&stream, 1, 0, MAX_STATE_BUF_ALLOC_SIZE * 64);
     }
 }
